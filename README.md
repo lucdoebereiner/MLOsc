@@ -1,1 +1,3 @@
-# MLOsc
+# DeepOSC
+
+Parameter prediction via OSC
