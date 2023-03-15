@@ -1,7 +1,4 @@
 import argparse
-import torch
-import torch.nn as nn
-import torch.optim as optim
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_server import BlockingOSCUDPServer
 from pythonosc import udp_client
@@ -9,11 +6,10 @@ from sklearn.preprocessing import MinMaxScaler
 import numpy as np
 import pickle
 import tensorflow as tf
+from keras.layers import Dense, Flatten
+from keras import Input, Model
 import json
 
-# todo
-# report loss via osc
-# read data from file
 
 
 # OSC SERVER and ENDPOINTS
@@ -23,38 +19,37 @@ def point_handler(address, *args):
     print(len(program_state.data.input_data))
 
 
+class LossCallback(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        client.send_message("/loss", [epoch, logs['loss']])
+
+
 def train_handler(address, *args):
-    program_state.data.scale(program_state.normalize_input)
-    input_tensor = torch.from_numpy(program_state.data.input_data_array)
-    target_tensor = torch.from_numpy(program_state.data.output_data_array)
-    ds = torch.utils.data.TensorDataset(input_tensor, target_tensor)
-    train_loader = torch.utils.data.DataLoader(ds, batch_size=program_state.batch_size, shuffle=True)
-    for epoch in range(int(args[0])):
-        loss = 0
-        for batch_idx, (features, targets) in enumerate(train_loader):
-            # print(f'{epoch} {batch_idx} {features} {targets}')
-            program_state.optimizer.zero_grad()  # zero the gradient buffers
-            output = program_state.net(features)
-            loss = program_state.criterion(output, targets)
-            loss.backward()
-            program_state.optimizer.step()
-        if (epoch % program_state.loss_report) == 0:
-            client.send_message("/loss", loss.item())
+    program_state.data.scale()
+    input_tensor = program_state.data.input_data_array
+    target_tensor = program_state.data.output_data_array
+    epochs = int(args[0])
+    print(input_tensor.shape)
+    print(target_tensor.shape)
+    program_state.model.summary()
+    program_state.model.fit([input_tensor], [target_tensor], epochs=epochs,
+                            batch_size=program_state.batch_size, callbacks=[LossCallback()], verbose=0)
 
 
 def predict_handler(address, *args):
-    with torch.no_grad():
-        input_data = np.array(list(args), dtype='float32')
-        if program_state.normalize_input:
-            input_data = program_state.data.input_scaler.transform(input_data.reshape(1, -1))
-        input_tensor = torch.from_numpy(input_data.reshape(1, -1))
-        pred = program_state.net(input_tensor)
-        pred_scaled = program_state.data.output_scaler.inverse_transform(pred.numpy())
-        client.send_message(program_state.client_path, *(pred_scaled.tolist()))
+    input_data = np.array(list(args), dtype='float32')
+    input_data = program_state.data.input_scaler.transform(input_data.reshape(1, -1))
+    #print(input_data)
+    pred = program_state.model.predict(input_data, verbose=0)
+    #print(pred)
+    pred_scaled = program_state.data.output_scaler.inverse_transform(np.array(pred[0].reshape(1,-1)))
+    #print(pred_scaled)
+    client.send_message(program_state.client_path, *(pred_scaled.tolist()))
 
 
 def save_handler(address, *args):
     program_state.save(args[0])
+
 
 
 def save_data_handler(address, *args):
@@ -63,7 +58,6 @@ def save_data_handler(address, *args):
 
 def default_handler(address, *args):
     print(f"Unknown endpoint {address}: {args}")
-
 
 
 dispatcher = Dispatcher()
@@ -100,7 +94,7 @@ program_state = None
 class ProgramState:
     def __init__(self):
         self.normalize_input = True
-        self.batch_size = 5
+        self.batch_size = 8
         self.loss_report = None
         self.net = None
         self.data = None
@@ -151,33 +145,28 @@ class Data:
         self.output_data_array = self.output_scaler.fit_transform(self.output_data_array)
 
     def save(self, file_name):
-        self.scale()
-        data = {'input': self.input_data_array.tolist(), 'output': self.output_data_array.tolist()}
+        data = {'input': self.input_data, 'output': self.output_data}
         with open(file_name, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
 
     def load(self, file_name):
         with open(file_name) as json_file:
             data = json.load(json_file)
-            self.input_data_array = np.array(data['input'])
-            self.output_data_array = np.array(data['output'])
+            self.input_data = data['input']
+            self.output_data = data['output']
+        self.scale()
 
 
 
-class Net(nn.Module):
-
-    def __init__(self, layers_size, depth, n_in, n_out):
-        super(Net, self).__init__()
-
-        # layers_size = (n_in + n_out) // 2
-        self.layers = nn.ModuleList([nn.Linear(n_in, layers_size)])
-        self.layers.extend([nn.Linear(layers_size, layers_size) for i in range(1, depth - 1)])
-        self.layers.append(nn.Linear(layers_size, n_out))
-
-    def forward(self, x):
-        for f in self.layers:
-            x = torch.sigmoid(f(x))
-        return x
+def make_model(layer_size, depth, n_in, n_out):
+    input = Input(shape=(n_in))
+    x = Dense(layer_size, activation='relu')(input)
+    for i in range(depth - 1):
+        x = Dense(layer_size, activation='relu')(x)
+    output = Dense(n_out, activation='sigmoid')(x)
+    model = Model(inputs=input, outputs=output)
+    model.compile(loss='mse', optimizer='adam')
+    return model
 
 
 if __name__ == '__main__':
@@ -185,19 +174,15 @@ if __name__ == '__main__':
 
     if args.load_file is not None:
         program_state = ProgramState.load(args.load_file)
+        #print("loaded")
+        #print(program_state.data.input_data_array)
     else:
         program_state = ProgramState()
         program_state.port = args.port_in
-        program_state.net = Net(args.layers_size, args.depth, args.input, args.output)
+        program_state.model = make_model(args.layers_size, args.depth, args.input, args.output)
+        program_state.data = Data(args.input, args.output)
         if args.load_data_file is not None:
-            loaded_with_data = ProgramState.load(args.load_data_file)
-            program_state.data = loaded_with_data.data
-        else:
-            program_state.data = Data(args.input, args.output)
-        program_state.loss_report = args.loss_report
-        program_state.criterion = nn.MSELoss()
-        program_state.optimizer = optim.Adam(program_state.net.parameters())
-        program_state.client_path = args.pred_path
+            program_state.data.load(args.load_data_file)
         program_state.normalize_input = args.unscaled_input
         program_state.batch_size = args.batch_size
 
