@@ -46,6 +46,17 @@ def predict_handler(address, *args):
     #print(pred_scaled)
     client.send_message(program_state.client_path, *(pred_scaled.tolist()))
 
+def predict_cb_handler(address, *args):
+    input_args = list(args)
+    input_data = np.array(input_args[1:], dtype='float32')
+    cb_path = input_args[0]
+    #print(cb_path)
+    input_data = program_state.data.input_scaler.transform(input_data.reshape(1, -1))
+    pred = program_state.model.predict(input_data, verbose=0)
+    pred_scaled = program_state.data.output_scaler.inverse_transform(np.array(pred[0].reshape(1,-1)))
+    client.send_message(cb_path, *(pred_scaled.tolist()))
+
+    
 
 def save_handler(address, *args):
     program_state.save(args[0])
@@ -64,6 +75,7 @@ dispatcher = Dispatcher()
 dispatcher.map("/nn/point", point_handler)
 dispatcher.map("/nn/train", train_handler)
 dispatcher.map("/nn/pred", predict_handler)
+dispatcher.map("/nn/predcb", predict_cb_handler)
 dispatcher.map("/save", save_handler)
 dispatcher.map("/savedata", save_data_handler)
 dispatcher.set_default_handler(default_handler)
